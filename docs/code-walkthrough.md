@@ -2,7 +2,7 @@
 
 A senior-engineer commentary on every code file in the project: what it does, why it's structured that way, and what would break if it were done differently. The code itself stays lean; the prose lives here.
 
-Updated through Phase 2 (database layer).
+Updated through Phase 3 (authentication).
 
 ---
 
@@ -161,6 +161,159 @@ The first schema migration: extensions, a reusable trigger function, businesses 
 
 ---
 
+## `internal/auth/models.go`
+
+Domain types and request/response shapes for auth.
+
+### Key decisions
+
+- **`json:"-"` on `PasswordHash`.** The field stays on the struct (the service needs it for bcrypt comparison) but the JSON encoder is forbidden from emitting it. Even if a future handler accidentally returns `user` directly, the hash cannot leak.
+- **`*string` for nullable optional fields.** `Business.Industry` and `Business.Size` are nullable in Postgres. Using `*string` (not `string`) distinguishes "absent" from "empty string." `omitempty` then drops nil values from JSON.
+- **`Token` is `omitempty`.** Auth responses for register/login carry a token; `/me` does not need one and would expose an empty-string field without `omitempty`.
+- **camelCase JSON tags throughout.** Matches the envelope spec (`meta.pageSize`) and frontend conventions.
+
+---
+
+## `internal/auth/password.go`
+
+A two-function wrapper around bcrypt.
+
+### Key decisions
+
+- **Wrap the library even though it's two lines.** Centralizes the cost factor and the algorithm choice. If we switch to argon2id later, one file changes.
+- **Cost factor 12.** OWASP 2025 recommendation. ~40ms per hash on modern hardware — slow enough to deter brute force, fast enough to not DoS the login endpoint.
+- **Bcrypt embeds the salt in the hash.** No separate salt column, no manual salt handling. `CompareHashAndPassword` extracts the salt automatically.
+
+### What would break if done differently
+
+- `sha256(password)` instead of bcrypt → rainbow-table crackable in seconds.
+- Cost 4-6 → trivially brute-forceable on a modern GPU.
+- Cost 14+ → 1+ second login latency, your auth endpoint becomes a self-DoS surface.
+
+---
+
+## `internal/auth/jwt.go`
+
+JWT minting and verification, HS256.
+
+### Key decisions
+
+- **HS256 (symmetric).** One secret, used for both sign and verify. Simplest and matches the project's single-server-trust model. RS256 (asymmetric) is for cases where third parties need to verify without holding the signing key.
+- **Custom claims `bid` and `role` alongside `RegisteredClaims`.** `bid` = business ID. Embedding the tenant ID in the token means every authenticated request scopes to the right tenant without a DB lookup.
+- **Algorithm check is mandatory.** The verifier rejects any token whose signing method isn't HMAC. This blocks the famous `alg=none` attack — without the check, attackers can forge tokens by setting `alg=none` and dropping the signature.
+- **Sentinel `ErrInvalidToken`.** Middleware doesn't care whether the token was expired, malformed, or signature-mismatched — all are 401. One sentinel keeps that mapping clean.
+
+### What would break if done differently
+
+- Skip the algorithm check → `alg=none` attack lets anyone forge tokens.
+- No `ExpiresAt` → tokens live forever; stolen token = permanent compromise.
+- 16-character `JWT_SECRET` → offline brute-force (`hashcat`) cracks HS256 with weak keys in hours.
+
+---
+
+## `internal/auth/repository.go`
+
+The SQL layer. Translates Go calls into queries. No business logic.
+
+### Key decisions
+
+- **`DBTX` interface for transactional flexibility.** Both `*pgxpool.Pool` and `pgx.Tx` satisfy it (matching `QueryRow` and `Exec` signatures). Repo methods accept any `DBTX`, so the same code works inside and outside a transaction. Without this, every method would need a transactional twin.
+- **`SELECT` named columns, not `*`.** Reordering columns in a future migration won't silently corrupt `Scan` targets.
+- **`RETURNING ...` on INSERT.** Lets us get DB-generated values (UUID, timestamps) in one round-trip instead of `INSERT` then `SELECT`.
+- **`NULLIF($n, '')` for optional strings.** The frontend often sends `""` for empty optional fields. `NULLIF(value, '')` translates that to NULL inside the SQL, no Go-side preprocessing needed.
+- **`pgconn.PgError` for SQLSTATE matching.** `errors.As(err, &pgErr)` lets us match unique-violation (`23505`), foreign-key violation (`23503`), etc. by structured code, not fragile string matching against Postgres' error messages.
+- **Sentinel errors at the package boundary.** `ErrUserNotFound`, `ErrEmailTaken`. The service layer cares about *meaning*; the repo translates pgx errors into domain errors.
+
+### What would break if done differently
+
+- `SELECT *` → silent field corruption after a column reorder migration.
+- String matching against Postgres errors → breaks when PG changes the wording in a minor version.
+- No `DBTX` interface → every method doubled to support transactions, code triples.
+
+---
+
+## `internal/auth/service.go`
+
+Orchestration: validation, transaction management, token minting, user-enumeration safety.
+
+### Key decisions
+
+- **`pgx.BeginFunc` over manual transactions.** The manual pattern (`tx, _ := db.Begin(); defer tx.Rollback(); ... tx.Commit()`) is footgun-heavy. `BeginFunc(ctx, db, fn)` commits on `fn` returning nil, rolls back otherwise. One line of nesting handles all the cleanup.
+- **`Register` is atomic.** Business creation + user creation share one transaction. If the user INSERT fails (e.g. email conflict), the business is rolled back. No orphan tenants.
+- **User-enumeration safety in `Login`.** Whether the email doesn't exist or the password is wrong, we return the *same* error (`ErrInvalidCredentials`). Sites that say "email not registered" let attackers build a list of valid emails by trial.
+- **Password length cap of 72.** Bcrypt silently truncates inputs longer than 72 bytes. Without the cap, two passwords sharing the first 72 characters both validate against the same hash. Enforce explicitly.
+- **Validation lives in the service, not the handler.** The service is the API boundary. Future CLI tools or admin scripts that create users get the same checks without duplicating code.
+- **`fmt.Errorf("%w: detail", ErrValidation)` for typed wrapping.** The handler matches with `errors.Is(err, ErrValidation)` for the HTTP-status mapping *and* uses `err.Error()` for the user-facing message — both bits of info from one error.
+
+### What would break if done differently
+
+- No transaction in Register → user insert fails after business succeeds → orphan business survives.
+- "Email not found" vs "wrong password" distinct errors → trivial email enumeration.
+- No password length cap → bcrypt truncates silently → confusing security bug.
+
+---
+
+## `internal/auth/handler.go`
+
+HTTP-boundary glue. Parse JSON, call service, write response.
+
+### Key decisions
+
+- **Centralized error → status mapping in `writeServiceError`.** One switch over sentinel errors. New error type? One case to add.
+- **Generic message on 500.** `response.Fail(w, 500, "internal server error")` — never echo the inner error to the wire. The structured server log keeps the real message; the public response stays opaque.
+- **`UserIDFromContext` from the auth package, not the handler.** Handler doesn't know whether auth comes from a JWT, a session cookie, or something else. The middleware writes the context value, the handler reads it. Replace the middleware tomorrow, the handler doesn't change.
+
+---
+
+## `internal/auth/context.go`
+
+Context key plumbing — the seam between middleware and handler.
+
+### Key decisions
+
+- **Private typed key, not a string.** Go's context docs explicitly warn that string keys are collision-prone across packages. `type ctxKey int` with private values means no other package can collide with ours, even by accident.
+- **Three values: user ID, business ID, role.** All three are non-secret IDs that downstream handlers will need. Putting them in context once at the middleware layer beats pulling JWT claims apart in every handler.
+- **Symmetric write/read helpers (`WithUserContext` / `*FromContext`).** Keeps the key handling inside this file. Handlers don't see the `ctxKey` type at all.
+
+### What would break if done differently
+
+- String key like `"userID"` → another package using `"userID"` silently overwrites your value at runtime, no compile error.
+- Storing the whole `User` struct in context → every authenticated request blocks on a DB lookup before reaching the handler.
+
+---
+
+## `internal/middleware/auth.go`
+
+Bearer-token middleware. Extracts the token, verifies via `JWTService`, injects user context.
+
+### Key decisions
+
+- **`func(http.Handler) http.Handler`** signature. The canonical Go middleware shape. Chi accepts it directly via `Use`.
+- **Factory function `RequireAuth(jwt *auth.JWTService)`.** Takes the JWT service as a dependency and returns the middleware. This is how middleware acquires runtime config without becoming a singleton.
+- **`r.WithContext(ctx)` to thread the new context.** Returns a shallow copy of the request — never mutate the existing request's context directly, that's not safe across goroutines or future handlers.
+- **Reject `Authorization` headers that don't start with `Bearer `.** 401 with a clear message. We don't try to accept tokens via query params or cookies — Bearer in the header is the unambiguous canonical form for API auth.
+
+### What would break if done differently
+
+- Apply this middleware to public routes (`/login`) → chicken-and-egg: you need a token to get a token.
+- Mutate `r.Context()` instead of `r.WithContext(...)` → race conditions across handler goroutines.
+- Read JWT directly in handlers instead of using context → coupling between every handler and the JWT format. Switching auth methods means rewriting every handler.
+
+---
+
+## `cmd/server/main.go` (Phase 3 additions)
+
+Wiring now constructs the auth stack and mounts protected/public routes via `chi.Router.Group`.
+
+### Key additions
+
+- **`auth.NewJWTService(jwtSecret, jwtTTL)` constructed before service.** Single instance shared by middleware and service — they sign and verify with the same secret.
+- **`r.Route("/api/auth", ...)` for the URL prefix.** Inside, `r.Post` for public endpoints and `r.Group` for the protected `/me`. `Group` applies its middleware (`appmiddleware.RequireAuth`) only to routes registered inside it. Public siblings are unaffected.
+- **Import aliasing.** `chimiddleware` for Chi's built-ins, `appmiddleware` for ours. Two packages with the same final name — aliasing resolves the conflict without ambiguity.
+- **`envDuration` for `JWT_TTL`.** `time.ParseDuration("24h")` accepts human-friendly strings like `"24h"`, `"1h30m"`, `"500ms"`. Better than parsing an integer and multiplying.
+
+---
+
 ## `.env`
 
 | Variable | Purpose |
@@ -170,6 +323,8 @@ The first schema migration: extensions, a reusable trigger function, businesses 
 | `DATABASE_URL` | `postgres://user:pass@host:port/db?sslmode=...`. Production should be `sslmode=require` or stricter. |
 | `DB_MAX_CONNS` | Pool cap. Default 10 in `main.go`. |
 | `DB_MIN_CONNS` | Idle connections kept warm. Default 2. |
+| `JWT_SECRET` | HS256 signing key. Generate via `openssl rand -base64 64`. Minimum 32 bytes — shorter keys are offline-crackable. |
+| `JWT_TTL` | Access token lifetime. Accepts Go duration strings (`24h`, `15m`, `1h30m`). Default 24h. |
 
 `.env` is loaded by `godotenv.Load()` in `main.go`. A missing `.env` is non-fatal — production injects env vars from the platform (k8s, fly.io, systemd) and no file exists.
 
@@ -195,4 +350,16 @@ go run ./cmd/server
 # Quick checks
 curl http://localhost:8080/health
 curl http://localhost:8080/health/db
+
+# Auth flow
+curl -X POST http://localhost:8080/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"businessName":"Acme","email":"a@a.com","password":"pass1234","name":"A"}'
+
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"a@a.com","password":"pass1234"}' \
+  | jq -r .data.token)
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/auth/me
 ```
