@@ -2,7 +2,7 @@
 
 A senior-engineer commentary on every code file in the project: what it does, why it's structured that way, and what would break if it were done differently. The code itself stays lean; the prose lives here.
 
-Updated through Phase 3 (authentication).
+Updated through Phase 4 (customers).
 
 ---
 
@@ -314,6 +314,120 @@ Wiring now constructs the auth stack and mounts protected/public routes via `chi
 
 ---
 
+## `migrations/0002_create_customers.up.sql` & `.down.sql`
+
+Adds the `customers` table — multi-tenant, soft-deletable, indexed for the common read paths.
+
+### Schema decisions
+
+| Choice | Why |
+|---|---|
+| `business_id UUID REFERENCES businesses(id) ON DELETE CASCADE` | Every customer belongs to a tenant. Deleting a business takes its customers with it. The most-queried column. |
+| `email CITEXT` (nullable) | Customers might not have email. CITEXT keeps case-insensitive matching consistent with the users table. |
+| `risk_level TEXT CHECK (... IN ('low','medium','high'))` | Same TEXT + CHECK idiom as `users.role` — ALTER-friendly, no ENUM type rigidity. |
+| `credit_limit NUMERIC(14,2)` | Money column. **Never `float`** — floating-point cents = silent rounding bugs in financial software. |
+| `deleted_at TIMESTAMPTZ NULL` | Three states in one column: NULL = active, non-NULL = soft-deleted at that timestamp. |
+| `customers_business_id_active_idx` *partial* on `(business_id, created_at DESC) WHERE deleted_at IS NULL` | The hot-path index. Excludes soft-deleted rows → smaller, faster. Includes `created_at DESC` for the default sort. |
+| `customers_business_id_email_uniq` *partial unique* on `(business_id, email) WHERE email IS NOT NULL AND deleted_at IS NULL` | Per-tenant email uniqueness. Partial so: NULL emails are allowed; deleted rows free up their email for reuse. |
+
+### Why partial indexes matter
+
+A plain `UNIQUE(business_id, email)` would:
+1. Reject inserts if any deleted row had the same email — leaking soft-delete state to the API.
+2. Reject `NULL` emails as duplicates of each other (Postgres treats NULLs as distinct in UNIQUE, but multiple NULLs are still confusing in practice).
+
+The partial unique with `WHERE email IS NOT NULL AND deleted_at IS NULL` says: "uniqueness only applies among active rows that actually have an email." That's exactly the semantic we want.
+
+---
+
+## `internal/customers/models.go`
+
+Domain type + request shapes + list query.
+
+### Key decisions
+
+- **Pointer fields on `Customer`** for nullable columns (`Email`, `Phone`, `CompanyName`, `Address`, `Notes`). `*string` distinguishes "value is NULL in DB" from "value is empty string."
+- **`UpdateRequest` uses pointers on every field.** This is *the* PATCH semantic: a `nil` pointer means "field was not in the JSON, leave unchanged." A non-nil pointer to `""` means "client explicitly cleared this field." Plain `string` collapses the two.
+- **`ListQuery` is a value struct, not a URL parser.** Handler does the URL parsing; service receives a clean Go struct. Keeps query-parsing details out of the service.
+- **`DeletedAt` deliberately absent from JSON.** API contract is "deleted = doesn't exist." Soft delete is a storage detail.
+
+---
+
+## `internal/customers/repository.go`
+
+The SQL layer. Tenant-scoped on every method.
+
+### Key decisions
+
+- **`businessID` is always the first non-context argument.** No method allows lookup by ID alone — the signature itself enforces tenant scoping. A code review can spot `GetByID(id)` instantly as wrong.
+- **Every query filters `WHERE business_id = $1 AND deleted_at IS NULL`** (except SoftDelete, which omits `deleted_at IS NULL` from its own SET clause but keeps the WHERE).
+- **`customerColumns` constant + `scanCustomer` helper.** DRY across five repo methods. One column-list change in one place.
+- **Dynamic UPDATE with `add(col, val)` closure.** Builds parallel `sets` slice and `args` slice atomically so the `$N` placeholder index always matches the args length. The naive separate-slices approach is footgun-rich (off-by-one nightmare).
+- **`pgconn.PgError` for `23505` matching.** Postgres SQLSTATE for unique violation. `errors.As` extracts the typed error; we map it to `ErrEmailTaken`. Don't match on error message strings — they change between PG versions.
+- **`List` returns `(items, total, error)`.** Two queries — one for the page, one for `COUNT(*)`. Acceptable for typical SaaS scale; cursor pagination is a future upgrade when count cost becomes painful.
+- **Secondary sort by `id ASC`** in `ORDER BY`. Stabilizes pagination when sort values tie. Without it, two rows with the same `created_at` could appear on different pages or be skipped entirely.
+- **`SoftDelete` returns `ErrNotFound`** when no row matched (already deleted or never existed in this tenant). Uses `tag.RowsAffected() == 0` as the signal — no extra query needed.
+
+### What would break if done differently
+
+- Forget `WHERE business_id = $1` → cross-tenant data leak. The number one multi-tenant bug.
+- Parameterize the sort column (`ORDER BY $1`) → PG interprets `$1` as the column *number*, not name; baffling silent reorder.
+- No `id` tiebreaker in ORDER BY → pagination skips/duplicates on equal sort values.
+- Match unique violations by `err.Error()` string match → breaks on the next PG minor version.
+
+---
+
+## `internal/customers/service.go`
+
+Validation, defaults, sort whitelisting, pagination clamping.
+
+### Key decisions
+
+- **Sort *whitelist* via `sortFields map[string]string`.** Maps public API names (`createdAt`, `riskLevel`) to SQL column names (`created_at`, `risk_level`). User input that isn't a key → reject. **This is the only safe pattern for dynamic ORDER BY** — column names cannot be parameterized in SQL.
+- **`-` prefix means DESC** (`?sort=-name`). Common REST API convention. Easy to construct client-side, easy to parse server-side.
+- **`map[string]struct{}` for set membership.** Zero-byte values; idiomatic "is X in this set." Reads better than `map[string]bool` with an unused value.
+- **Pagination clamping centralized here.** `page < 1 → 1`, `pageSize > 100 → 100`. Repo trusts what it gets — bypass the service (CLI, tests) and it still functions; service is where the defaults live.
+- **`validateUpdate` operates through the pointer** (`if r.Name != nil` then `*r.Name`). Only validates fields the client actually sent. Empty unsupplied fields don't fail validation.
+
+### What would break if done differently
+
+- Pass user's `sort` straight to SQL → SQL injection. `?sort=name;DROP TABLE customers--` is just one example.
+- No `pageSize` cap → client can request 1,000,000 → OOM on the count + scan.
+- Use `map[string]bool` for the risk-level set → wastes a byte per entry, less idiomatic.
+
+---
+
+## `internal/customers/handler.go`
+
+HTTP boundary. URL params, query parsing, error → status mapping.
+
+### Key decisions
+
+- **`auth.BusinessIDFromContext(r.Context())` at the top of every handler.** Single point of "no auth = 401." The auth middleware already would have rejected unauthenticated requests, but this is defense-in-depth — if someone forgets `RequireAuth` on a route, the handler still won't leak data.
+- **`chi.URLParam(r, "customerId")` for path variables.** Chi reads from the URL pattern (`/{customerId}`); no manual splitting.
+- **`atoiOr` for safe query-param parsing.** `?page=abc` falls back to default. Never 500 on a non-critical malformed param.
+- **`204 No Content` for DELETE.** REST convention. No body, no envelope.
+- **`response.SuccessWithMeta` for List.** The pagination helper from Phase 1 finally has a real caller.
+
+### What would break if done differently
+
+- No `BusinessIDFromContext` check → if `RequireAuth` is ever accidentally removed from the route, every handler silently runs with empty `businessID`, returning empty lists everywhere.
+- Return `Success` instead of `204` for DELETE → still works, but bloats the response and breaks REST convention.
+- Crash on bad query params → trivial DoS vector.
+
+---
+
+## `cmd/server/main.go` (Phase 4 additions)
+
+Three new constructor lines, one new route block. The pattern is meant to be boring and repeatable — that's the point.
+
+### Key additions
+
+- **`r.Route("/api/customers", ...)` with `r.Use(RequireAuth(jwtSvc))` inside.** All five customer routes need auth. No inner `Group` like we used for `/api/auth/me` because there are no public sibling routes.
+- **Three constructor lines** (repo → service → handler) per module. Future phases (debts, payments) will copy-paste-modify these three lines. When the wiring approaches ~30 lines we'll extract a `bootstrap()` function; for now it stays in main.
+
+---
+
 ## `.env`
 
 | Variable | Purpose |
@@ -362,4 +476,24 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
   | jq -r .data.token)
 
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/auth/me
+
+# Customers (all protected)
+curl -X POST http://localhost:8080/api/customers \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"John Roe","email":"john@roe.test","riskLevel":"medium","creditLimit":5000}'
+
+# List with filters and pagination
+curl -H "Authorization: Bearer $TOKEN" \
+  'http://localhost:8080/api/customers?search=john&riskLevel=medium&sort=-createdAt&page=1&pageSize=20'
+
+# Detail
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/customers/{id}
+
+# Patch (only fields you want changed)
+curl -X PATCH http://localhost:8080/api/customers/{id} \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"riskLevel":"high","creditLimit":1000}'
+
+# Soft delete
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/customers/{id}
 ```
