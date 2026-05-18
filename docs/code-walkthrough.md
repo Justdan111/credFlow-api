@@ -2,7 +2,7 @@
 
 A senior-engineer commentary on every code file in the project: what it does, why it's structured that way, and what would break if it were done differently. The code itself stays lean; the prose lives here.
 
-Updated through Phase 4 (customers).
+Updated through Phase 5 (debts).
 
 ---
 
@@ -428,6 +428,105 @@ Three new constructor lines, one new route block. The pattern is meant to be bor
 
 ---
 
+## `migrations/0003_create_debts.up.sql` & `.down.sql`
+
+The `debts` table — money owed by a customer, tenant-scoped, soft-deletable, with a status lifecycle.
+
+### Schema decisions
+
+| Choice | Why |
+|---|---|
+| `amount NUMERIC(14,2) CHECK (amount > 0)` | Money is never `float`. A zero/negative debt is nonsense — the DB rejects it. |
+| `status TEXT CHECK (... IN ('pending','partial','paid'))` | Stored lifecycle state. `partial` is reserved for Phase 6 (payments); Phase 5 transitions only pending→paid. |
+| `issued_date DATE`, `due_date DATE` | **Calendar days, not instants.** A due date is "June 30", not "June 30 00:00:00+01". `DATE` avoids timezone bugs in overdue calculations. |
+| `paid_at TIMESTAMPTZ` | **An instant, not a day.** The exact moment of payment. Deliberate contrast with the `DATE` columns. |
+| `business_id` FK `ON DELETE CASCADE` | Tenant teardown should be clean. |
+| `customer_id` FK `ON DELETE RESTRICT` | Protects financial history. Customers are soft-deleted so this never fires in normal flow — but if a customer is ever hard-deleted, RESTRICT blocks silent loss of their debts. |
+| `CHECK (due_date >= issued_date)` | Table-level (spans two columns). A debt due before it was issued is physically unstorable. |
+| 3 partial indexes | Tenant list `(business_id, created_at DESC)`, per-customer `(customer_id)`, due-date `(business_id, due_date)` — all `WHERE deleted_at IS NULL`. |
+
+### `overdue` is derived, not stored
+
+A debt is overdue when `due_date < CURRENT_DATE AND status <> 'paid'`. That depends on *today's date* — a stored `overdue` column would need a nightly cron job to stay correct. Instead it's computed in every SELECT. Always correct, zero background infrastructure.
+
+### Currency: deliberately omitted
+
+No multi-currency requirement exists in the spec, and `businesses` has no currency column. Adding `currency` now would be speculative (YAGNI). It's a clean future migration if multi-currency is ever needed.
+
+---
+
+## `internal/debts/models.go`
+
+Domain type + request shapes + list query.
+
+### Key decisions
+
+- **Derived fields on the struct: `Overdue bool`, `AmountRemaining float64`.** Computed in SQL (`overdue`) or trivially (`amount_remaining` = amount or 0). Not columns. The client can't tell the difference — that's the point.
+- **Dates as `string` in request types** (`CreateRequest.DueDate`, `UpdateRequest.DueDate`). Go's `encoding/json` only unmarshals `time.Time` from RFC3339; a bare `"2026-06-30"` fails. Taking strings and parsing in the service yields a friendly *"dueDate must be YYYY-MM-DD"* error.
+- **`*time.Time` for `PaidAt`.** Nil until paid.
+
+---
+
+## `internal/debts/repository.go`
+
+The SQL layer. Tenant-scoped, same discipline as customers, plus two patterns unique to debts.
+
+### Pattern 1 — `INSERT ... SELECT ... WHERE EXISTS` (atomic customer check)
+
+`Create` inserts the debt *only if* an active customer exists in the tenant:
+
+```sql
+INSERT INTO debts (...)
+SELECT $1, $2, ...
+WHERE EXISTS (SELECT 1 FROM customers WHERE id = $2 AND business_id = $1 AND deleted_at IS NULL)
+RETURNING ...
+```
+
+The naive alternative — "SELECT to check the customer, then INSERT" — is a TOCTOU race: the customer could be deleted between the two statements. Folding the check into the INSERT makes it one atomic operation under one snapshot. If the customer isn't valid, 0 rows insert, `RETURNING` is empty, `pgx.ErrNoRows` fires → mapped to `ErrCustomerNotFound`.
+
+### Pattern 2 — `MarkPaid` two-step disambiguation
+
+`UPDATE ... SET status='paid' WHERE ... AND status <> 'paid'` affects 0 rows in *two* different cases: the debt doesn't exist, or it's already paid. A single statement can't tell them apart. So on 0 rows, `MarkPaid` does one follow-up `Get` to disambiguate: `ErrNotFound` vs `ErrAlreadyPaid`. The extra query only runs on the failure path — the happy path stays a single statement.
+
+### Other notes
+
+- **`debtSelect` constant** holds the column list *plus* the two derived expressions (`overdue`, `amount_remaining`). Every read uses it, so the derived values are computed identically everywhere — no drift between Get, List, Create, MarkPaid.
+- **`CustomerExists`** — a cheap `SELECT EXISTS(...)` used by the nested endpoint to 404 a bad customer id instead of returning an empty list.
+
+---
+
+## `internal/debts/service.go`
+
+Validation, date parsing, sort whitelist, status filtering.
+
+### Key decisions
+
+- **Go's reference-date layout: `"2006-01-02"`.** Go date layouts ARE a specific reference time (`01/02 03:04:05PM '06 -0700`), not strftime codes. `time.Parse("2006-01-02", "2026-06-30")` parses a `YYYY-MM-DD` date.
+- **`due.Before(issued)` guard.** Service-layer friendly error; the DB `CHECK` is the backstop.
+- **`ListByCustomer` reuses `List`.** It verifies the customer exists, sets `q.CustomerID`, and delegates — no duplicated pagination/filter/sort logic.
+- **Sort whitelist** (`createdAt`, `dueDate`, `amount`, `status`, `updatedAt`) — same anti-injection pattern as customers.
+
+---
+
+## `internal/debts/handler.go`
+
+HTTP boundary. Same shape as the customers handler, plus:
+
+- **`MarkPaid`** — handles the `POST /api/debts/{debtId}/mark-paid` action endpoint. Returns the updated debt (200), or 409 if already paid.
+- **`ListByCustomer`** — handles the nested `GET /api/customers/{customerId}/debts`. Reads `customerId` from the path, debt filters from the query string.
+- **`parseListQuery` helper** — shared by `List` and `ListByCustomer` to build a `ListQuery` from URL params.
+- Error mapping adds `ErrAlreadyPaid → 409` and `ErrCustomerNotFound → 404`.
+
+---
+
+## `cmd/server/main.go` (Phase 5 additions)
+
+- **Constructor trio** for debts (repo → service → handler).
+- **New `/api/debts` route group** behind `RequireAuth`, with the `mark-paid` action as `POST /{debtId}/mark-paid`.
+- **Nested route** `GET /api/customers/{customerId}/debts` added *inside* the existing `/api/customers` group — it's a customer-shaped URL served by the debts handler. Route placement and handler ownership are independent.
+
+---
+
 ## `.env`
 
 | Variable | Purpose |
@@ -496,4 +595,19 @@ curl -X PATCH http://localhost:8080/api/customers/{id} \
 
 # Soft delete
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/customers/{id}
+
+# Debts (all protected)
+curl -X POST http://localhost:8080/api/debts \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"customerId":"{cid}","amount":1500.00,"description":"Invoice #42","dueDate":"2026-06-30"}'
+
+# List with filters
+curl -H "Authorization: Bearer $TOKEN" \
+  'http://localhost:8080/api/debts?status=pending&overdue=true&sort=dueDate&page=1'
+
+# Mark a debt paid
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/debts/{id}/mark-paid
+
+# One customer's debts (nested)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/customers/{cid}/debts
 ```
