@@ -485,6 +485,9 @@ is fixed once set (`amount`, `issued_date`), store it.
 - [x] Layered architecture, consistent across modules
 - [x] Multi-tenant isolation, verified by test runs
 - [x] Manual end-to-end verification each phase (curl suites)
+- [x] **Automated test suite**: 95+ assertions across unit, HTTP-handler, and integration tiers
+- [x] **CI pipeline** (`.github/workflows/test.yml`) running build, vet, unit, and integration tests
+- [x] **Makefile** with `test`, `test-integration`, `test-all`, `db-up`, `db-reset` targets
 
 ---
 
@@ -494,15 +497,24 @@ This is the honest gap. The catalog in [endpoints.md](endpoints.md) lists ~80 en
 we have 16. But missing *endpoints* is the smaller problem — the missing *engineering*
 below matters more.
 
-### 9.1 Testing — the biggest gap
+### 9.1 Testing — foundation laid ✓ (was the biggest gap)
 
-There is currently **zero automated test code.** Verification has been manual curl runs.
-Production needs:
-- **Unit tests** for services (validation, business rules) — fast, no database.
-- **Repository/integration tests** against a real Postgres (e.g. via `testcontainers`).
-- **HTTP-level tests** using `net/http/httptest`.
-- A test that *asserts* cross-tenant isolation, so a future change can't silently break it.
-- CI that runs `go test ./...`, `go vet`, and a linter on every push.
+A baseline test suite is now in place (~95 passing assertions). It covers:
+- **Unit tests** for `pkg/response`, `internal/auth` (password, JWT including the
+  `alg=none` regression, validation), `internal/customers` and `internal/debts`
+  (sort whitelist, pagination clamping, validation).
+- **HTTP-handler tests** for `internal/middleware` via `httptest`.
+- **Integration tests** under `test/integration/` (build tag `integration`) that
+  exercise the full HTTP→service→repo→Postgres stack — including the headline
+  `TestTenantIsolation` that asserts no cross-tenant access path returns success.
+- CI via `.github/workflows/test.yml` running build, vet, unit, and integration
+  tests against a Postgres service container on every push.
+
+What still belongs in this category as the codebase grows:
+- Tests for each new endpoint as it's added.
+- Repository-level tests that exercise SQL edge cases directly.
+- A linter beyond `go vet` (`golangci-lint`).
+- Coverage reporting in CI with a minimum threshold.
 
 ### 9.2 Remaining features
 
@@ -576,9 +588,8 @@ Production needs:
 
 A pragmatic sequence — each step makes the next safer:
 
-1. **Add a test suite now**, before the codebase grows further. Lock in the behaviour
-   (especially tenant isolation) you've already verified by hand.
-2. **Set up CI** to run those tests + `go vet` + a linter on every commit.
+1. ~~Add a test suite~~ ✓ Done — unit + HTTP + integration tiers, CI workflow.
+2. ~~Set up CI~~ ✓ Done — `.github/workflows/test.yml` runs the suite on every push.
 3. **Phase 6 — Payments**, with idempotency keys, written test-first this time.
 4. **RBAC enforcement** — start checking the `role` claim on destructive endpoints.
 5. **Refresh tokens + revocation** — close the "token valid until expiry" gap.

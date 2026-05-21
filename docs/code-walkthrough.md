@@ -2,7 +2,7 @@
 
 A senior-engineer commentary on every code file in the project: what it does, why it's structured that way, and what would break if it were done differently. The code itself stays lean; the prose lives here.
 
-Updated through Phase 5 (debts).
+Updated through Phase 5 (debts) and the initial test suite.
 
 ---
 
@@ -524,6 +524,62 @@ HTTP boundary. Same shape as the customers handler, plus:
 - **Constructor trio** for debts (repo → service → handler).
 - **New `/api/debts` route group** behind `RequireAuth`, with the `mark-paid` action as `POST /{debtId}/mark-paid`.
 - **Nested route** `GET /api/customers/{customerId}/debts` added *inside* the existing `/api/customers` group — it's a customer-shaped URL served by the debts handler. Route placement and handler ownership are independent.
+
+---
+
+## Test suite
+
+### Layout
+
+```
+pkg/response/response_test.go            unit  — envelope helpers
+internal/auth/password_test.go           unit  — bcrypt round-trip, salting
+internal/auth/jwt_test.go                unit  — JWT incl. alg=none rejection
+internal/auth/service_test.go            unit  — register validation
+internal/customers/service_test.go       unit  — sort whitelist + validation
+internal/debts/service_test.go           unit  — date parsing + validation
+internal/middleware/auth_test.go         http  — RequireAuth behaviour
+internal/testutil/testdb.go              helper — test DB connect + truncate
+test/integration/helpers_test.go         integration helpers (build tag)
+test/integration/auth_test.go            integration — register/login/me + enumeration
+test/integration/tenant_isolation_test.go integration — the headline isolation test
+Makefile                                 developer commands
+.github/workflows/test.yml               CI workflow
+```
+
+### How tiers separate
+
+- **Unit + HTTP-handler tests** live next to the code they test (Go convention).
+  They run with plain `go test ./...` — no Docker required.
+- **Integration tests** live under `test/integration/` and start with the build
+  constraint `//go:build integration`. They are *skipped* by `go test ./...` and
+  run only with `-tags=integration`. They need a Postgres database reachable at
+  `TEST_DATABASE_URL` (default: `credflow_test` in the local container).
+
+### Patterns worth keeping
+
+- **Table-driven tests with `t.Run(name, ...)`**: one test function, many input
+  rows, each row a named subtest. Failures point at the row name.
+- **`httptest.NewRecorder`** for in-process handler/middleware tests;
+  **`httptest.NewServer`** for full-stack integration tests over real HTTP.
+- **`json.RawMessage`** in the response envelope helper so each test decodes the
+  data block into whatever shape it expects.
+- **`t.Skipf` when DB unreachable** — keeps the unit suite green when Docker is
+  off; integration tests skip with a clear message instead of failing mysteriously.
+- **Security regression tests** (`TestJWT_rejectsAlgNone`,
+  `TestTenantIsolation`) — once a class of bug is locked in by a test, it can't
+  silently come back.
+
+### Running
+
+```bash
+make test               # unit only, fast — runs on every save in dev
+make test-integration   # integration only, needs Postgres
+make test-all           # everything
+```
+
+CI (`.github/workflows/test.yml`) runs the full suite on every push and PR,
+against a Postgres service container.
 
 ---
 
