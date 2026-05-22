@@ -2,7 +2,7 @@
 
 A senior-engineer commentary on every code file in the project: what it does, why it's structured that way, and what would break if it were done differently. The code itself stays lean; the prose lives here.
 
-Updated through Phase 5 (debts) and the initial test suite.
+Updated through Phase 6 (payments) and the test suite.
 
 ---
 
@@ -527,6 +527,122 @@ HTTP boundary. Same shape as the customers handler, plus:
 
 ---
 
+## `migrations/0004_create_payments.up.sql` & `.down.sql`
+
+The `payments` table. Linked to a customer (required) and a debt (optional).
+Idempotency keys live here.
+
+### Schema decisions
+
+| Choice | Why |
+|---|---|
+| `customer_id` FK `ON DELETE RESTRICT` | Same as debts — protect financial history. |
+| `debt_id` FK *nullable* `ON DELETE RESTRICT` | Payments may be unattributed cash, or tied to a specific debt. Nullable FK is a valid Postgres construct: NULL allowed, non-NULL must reference. |
+| `amount NUMERIC(14,2) CHECK (amount > 0)` | Money. No floats, no zero/negative. |
+| `method TEXT CHECK (... IN (...))` | Small enum: cash, card, bank_transfer, check, mobile_money, other. |
+| `paid_at TIMESTAMPTZ DEFAULT NOW()` | When the money actually moved (may be backdated by recording later). Distinct from `created_at`. |
+| `idempotency_key TEXT` (nullable) | Optional client-supplied retry guard. |
+| Partial unique on `(business_id, idempotency_key)` | Per-tenant uniqueness, ignoring NULLs and voided rows. |
+| 3 partial active-row indexes | Tenant list, per-customer, per-debt. |
+
+### The idempotency key is enforced by a database index
+
+There is no application-layer lock, no Redis, no separate idempotency-keys
+table. The unique index *is* the mechanism. The repository does INSERT;
+if SQLSTATE 23505 fires on this specific constraint, the request is a
+replay — fetch the existing payment and return it. Persistent across
+restarts, no race window, no extra infrastructure.
+
+---
+
+## `internal/payments/models.go`
+
+Three structs, same shape as the other modules. Notable: `IdempotencyKey`
+is read from the request body for now (`POST` body). A header-based variant
+(`Idempotency-Key: <uuid>`) is a simple later addition without a model
+change.
+
+---
+
+## `internal/payments/repository.go`
+
+### Three patterns layered together
+
+1. **`INSERT ... SELECT ... WHERE EXISTS`** with branching args — atomic
+   existence check for both the customer (always) and the debt (if linked).
+   No TOCTOU race.
+2. **Idempotency by constraint name** — `pgconn.PgError.ConstraintName` is
+   matched against the literal constraint name from migration 0004. SQLSTATE
+   alone is not enough: many unique constraints can fail; only one is the
+   idempotency guard. The constraint-name check is a teaching example of how
+   to be precise about which integrity violation just happened.
+3. **`RecomputeDebtStatus(ctx, db, businessID, debtID)`** — a CTE-based
+   UPDATE that reads the current debt amount + the SUM of active payments
+   and transitions status. The `WHEN current_status = 'paid' THEN 'paid'`
+   guard preserves administrative closes: voiding a payment against a
+   mark-paid debt does NOT reopen the debt. The administrative decision
+   outranks the arithmetic.
+
+### `DBTX` interface, again
+
+Both `*pgxpool.Pool` and `pgx.Tx` satisfy `interface{ QueryRow; Exec; Query }`.
+Every payment-repo method takes a `DBTX` so the service can run Create plus
+RecomputeDebtStatus under one transaction. Same pattern as the auth repo.
+
+---
+
+## `internal/payments/service.go`
+
+### One transaction per money-moving operation
+
+Both `Create` and `Delete` wrap their work in `pgx.BeginFunc`:
+- **Create:** insert payment → recompute linked debt status → commit, or
+  rollback if anything errors. On idempotency replay the recompute is
+  skipped (the original request already did it).
+- **Delete (void):** soft-delete payment → fetch debt_id from the soft-delete
+  result → recompute debt status → commit.
+
+This is the *single* most important pattern in Phase 6. A naive
+non-transactional implementation would let the server crash between INSERT
+payment and UPDATE debt, leaving the totals inconsistent. The transaction
+makes that impossible.
+
+### Why the service owns the transaction (not the repo)
+
+Repositories speak SQL. Services compose operations. The transaction is a
+*composition* decision: "these reads and writes belong together as one unit
+of work." That's the service's responsibility. Repository methods stay
+transaction-agnostic (they take `DBTX`) so they can be composed differently
+later.
+
+---
+
+## `internal/debts/repository.go` — Phase 6 update
+
+`debtSelect` now derives `amount_paid` (SUM of active payments) and
+`amount_remaining` (= amount when mark-paid, else amount minus the SUM)
+via a correlated subquery. The subquery references the outer row by the
+bare table name `debts.id` — which works in SELECT, INSERT...RETURNING,
+and UPDATE...RETURNING contexts uniformly. The `payments_debt_id_active_idx`
+makes the subquery cheap.
+
+The administrative-close case (`status = 'paid'`) stays as 0 remaining
+regardless of payment sum — so `mark-paid` and "paid via payments" both
+produce `amountRemaining = 0`, but the *path* is different.
+
+---
+
+## `cmd/server/main.go` (Phase 6 additions)
+
+- New constructor trio: `paymentRepo → paymentSvc → paymentHandler`.
+- `paymentHandler` takes `debtRepo` as a second dependency for `CreateForDebt`
+  (which reads the debt to extract `customerId` from the URL).
+- Two new nested mounts: `GET /api/customers/{id}/payments` (in the customers
+  group) and `POST /api/debts/{id}/payments` (in the debts group). Standalone
+  CRUD in `/api/payments`.
+
+---
+
 ## Test suite
 
 ### Layout
@@ -543,6 +659,8 @@ internal/testutil/testdb.go              helper — test DB connect + truncate
 test/integration/helpers_test.go         integration helpers (build tag)
 test/integration/auth_test.go            integration — register/login/me + enumeration
 test/integration/tenant_isolation_test.go integration — the headline isolation test
+test/integration/payments_test.go         integration — status transitions, idempotency, void
+internal/payments/service_test.go        unit  — validation + sort whitelist + date parsing
 Makefile                                 developer commands
 .github/workflows/test.yml               CI workflow
 ```

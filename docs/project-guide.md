@@ -474,12 +474,13 @@ is fixed once set (`amount`, `issued_date`), store it.
 - [x] Config via `.env`
 - [x] Liveness (`/health`) and readiness (`/health/db`) probes
 
-**Features (endpoints live: 16)**
+**Features (endpoints live: 22)**
 - [x] `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me`
 - [x] JWT auth middleware
 - [x] Customers — list, create, get, update, soft-delete
-- [x] Debts — list, create, get, update, soft-delete, mark-paid
-- [x] `GET /api/customers/{id}/debts`
+- [x] Debts — list, create, get, update, soft-delete, mark-paid; `amount_paid`/`amount_remaining` derived from payments
+- [x] Payments — list, create (with idempotency keys), get, void; atomic debt-status transitions
+- [x] Nested: `GET /api/customers/{id}/debts`, `GET /api/customers/{id}/payments`, `POST /api/debts/{id}/payments`
 
 **Quality**
 - [x] Layered architecture, consistent across modules
@@ -518,9 +519,9 @@ What still belongs in this category as the codebase grows:
 
 ### 9.2 Remaining features
 
-- **Payments** (Phase 6) — and the `amount_paid`/`status` interaction with debts.
-- **Idempotency keys** on payment creation — the spec calls for this on money-moving
-  actions so a double-submit doesn't double-charge.
+- ~~Payments~~ ✓ Done in Phase 6 — atomic status transitions, idempotency keys, void.
+- ~~Idempotency keys~~ ✓ Done — `(business_id, idempotency_key)` partial unique index;
+  replay returns 200 with the same row, no double-write.
 - **Refresh tokens + logout + token revocation** — currently a token is valid until it
   expires; there's no way to revoke one.
 - **Dashboard & analytics** aggregation endpoints.
@@ -590,7 +591,7 @@ A pragmatic sequence — each step makes the next safer:
 
 1. ~~Add a test suite~~ ✓ Done — unit + HTTP + integration tiers, CI workflow.
 2. ~~Set up CI~~ ✓ Done — `.github/workflows/test.yml` runs the suite on every push.
-3. **Phase 6 — Payments**, with idempotency keys, written test-first this time.
+3. ~~Phase 6 — Payments~~ ✓ Done — atomic transitions, idempotency, void rollback.
 4. **RBAC enforcement** — start checking the `role` claim on destructive endpoints.
 5. **Refresh tokens + revocation** — close the "token valid until expiry" gap.
 6. **Structured logging (`slog`)** — you'll want good logs before you have real traffic.
