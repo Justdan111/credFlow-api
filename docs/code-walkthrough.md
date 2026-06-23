@@ -643,6 +643,70 @@ produce `amountRemaining = 0`, but the *path* is different.
 
 ---
 
+## `internal/auth/roles.go` — RBAC
+
+Three string constants — `RoleOwner`, `RoleAdmin`, `RoleMember` — mirroring the `CHECK (role IN (...))` constraint on `users.role` in migration 0001.
+
+### Why constants and not just literals everywhere
+
+- **Compile-time typo defense.** `auth.RoleOnwer` is a build failure; `"onwer"` is a 200 OK that silently authorizes nobody. The middleware does a map lookup on the role string, so a typo would lock you out with no error trail.
+- **The DB is still the source of truth.** The constants must stay in sync with the migration's CHECK list — if you ever add a fourth role, you change both. The compiler can't catch that drift; a code review must.
+- **Where they live, not models.go.** Roles are policy values, not data shapes. Mixing them into `models.go` (which holds request/response structs) blurs the line. A tiny dedicated file makes the policy explicit.
+
+### What would break if done differently
+
+- Inline `"owner"` everywhere → a refactor that renames the role string has to find every string literal across the codebase. With a constant, you grep `RoleOwner` and the compiler handles the rest.
+
+---
+
+## `internal/middleware/role.go`
+
+The `RequireRole(allowed ...string)` middleware. Reads the role from request context (placed there by `RequireAuth`) and gates the route on a fixed allow-list.
+
+### Key decisions
+
+- **Variadic role list.** Callers write `RequireRole(auth.RoleOwner, auth.RoleAdmin)` — reads naturally. The first thing the middleware does is convert the slice into a `map[string]struct{}` *once*, when the middleware is built — not on every request. `struct{}` is zero bytes, so the map is the cheapest possible "is this string in the set" check.
+- **Closure over the role set.** The `set` map is captured in the returned closure. Built once at startup, queried millions of times after. No per-request allocation.
+- **403 vs 401, on purpose.** A logged-in user denied access gets `403 Forbidden`. A request with no role in context (which means `RequireAuth` wasn't in the chain) gets `401 Unauthorized`. Two distinct failure modes with two distinct status codes — clients can react correctly (refresh token vs surface "ask an admin").
+- **Misconfiguration is treated as auth failure, not server error.** No role in context means the route was set up wrong. We could return 500 (it *is* a server bug) but 401 is safer: it doesn't leak the existence of a protected route to an unauthenticated probe.
+- **Always chained AFTER `RequireAuth`.** The middleware has no fallback to fetch the role itself — it strictly depends on context plumbing done upstream. Order matters in chi; `r.Use(RequireAuth)` then `r.With(RequireRole(...))` is mandatory.
+
+### What would break if done differently
+
+- Build the map per-request → wasted allocations on every protected call. Fine for thousands of requests, ugly at millions.
+- Return 401 for the disallowed-role case → clients infinite-loop refreshing tokens, none of which solve the problem because the role isn't going to change.
+- Skip the "no role in context" guard → request hits a nil-or-empty string, the lookup misses, you return 403 — and the message says "insufficient role" when the actual bug is "no auth ran." Wrong signal for debugging.
+
+---
+
+## `cmd/server/main.go` — RBAC wiring
+
+Two named middleware instances built once: `ownerAdmin` and `ownerOnly`. The policy matrix:
+
+| Route | Gate | Why |
+|---|---|---|
+| `DELETE /api/payments/{id}` (void) | `ownerOnly` | Reverses a recorded payment. Most sensitive financial action. |
+| `DELETE /api/customers/{id}` | `ownerAdmin` | Soft-deletes a customer record. |
+| `DELETE /api/debts/{id}` | `ownerAdmin` | Soft-deletes a financial record. |
+| `PATCH /api/debts/{id}` | `ownerAdmin` | Can change amount/due date — money-affecting. |
+| Everything else under `/api/...` | `RequireAuth` only | Operational, not destructive. |
+
+### Why per-route `r.With(...)` rather than a sub-route group
+
+Each gated route attaches the middleware via `r.With(ownerAdmin).Delete(...)`. Could we instead create a `r.Route("/api/debts/...", { r.Use(ownerAdmin); ... })` sub-router? Yes — but then the *route group* signals "everything in here is owner+admin," which is misleading when most routes in the group aren't. Per-route attachment puts the policy right next to the verb. Reads cleanly: "POST is open, DELETE is owner+admin."
+
+### What would break if done differently
+
+- Apply `RequireRole` at the route-group level → suddenly listing customers requires owner+admin. Read-paths are accidentally locked down.
+- Forget the order (RequireRole before RequireAuth) → role lookup misses every request → 401 everywhere. Caught early because every call breaks; still a footgun worth knowing about.
+- Hardcode role strings in main.go → escape from the compile-time-checked constants we just established. Use `auth.RoleOwner`, not `"owner"`.
+
+### Stateless RBAC — known limitation
+
+The role comes from the JWT claim, not a fresh DB lookup. Pro: zero extra queries on the hot path. Con: a role change doesn't take effect until the user logs in again (or their token expires). Acceptable for now. The proper fix is paired with refresh-token rotation + revocation — next item on the roadmap.
+
+---
+
 ## Test suite
 
 ### Layout
@@ -655,6 +719,7 @@ internal/auth/service_test.go            unit  — register validation
 internal/customers/service_test.go       unit  — sort whitelist + validation
 internal/debts/service_test.go           unit  — date parsing + validation
 internal/middleware/auth_test.go         http  — RequireAuth behaviour
+internal/middleware/role_test.go         http  — RequireRole: allow, deny, missing-context
 internal/testutil/testdb.go              helper — test DB connect + truncate
 test/integration/helpers_test.go         integration helpers (build tag)
 test/integration/auth_test.go            integration — register/login/me + enumeration
